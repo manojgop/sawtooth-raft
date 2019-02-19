@@ -100,6 +100,10 @@ services:
     build:
       context: .
       dockerfile: ../Dockerfile
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
     volumes:
       - ${SAWOOTH_RAFT:-..}:/project/sawtooth-raft
     working_dir: /project/sawtooth-raft/

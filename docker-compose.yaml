@@ -8,6 +8,14 @@ services:
     image: sawtooth-raft-engine-local:$ISOLATION_ID
     build:
       context: .
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
     volumes:
       - ./:/project/sawtooth-raft
       - cargo-registry:/root/.cargo/registry
+    environment:
+      - 'http_proxy=${http_proxy}'
+      - 'https_proxy=${https_proxy}'
+      - 'no_proxy=${no_proxy}'

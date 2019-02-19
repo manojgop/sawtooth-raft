@@ -32,6 +32,10 @@ services:
     build:
       context: .
       dockerfile: admin.Dockerfile
+      args:
+        - http_proxy
+        - https_proxy
+        - no_proxy
     networks:
       validators:
       rest_apis:
