@@ -32,6 +32,8 @@ use storage::StorageExt;
 pub struct RaftEngineConfig<S: StorageExt> {
     pub peers: Vec<PeerId>,
     pub period: Duration,
+    pub leader_change_block_interval: u64,
+    pub leader_change_time_interval: Duration,
     pub raft: RaftConfig,
     pub storage: S,
 }
@@ -45,6 +47,10 @@ impl<S: StorageExt> RaftEngineConfig<S> {
         RaftEngineConfig {
             peers: Vec::new(),
             period: Duration::from_millis(3_000),
+            // Leader change based on block interval is disabled by default
+            leader_change_block_interval: 0,
+            // Leader change based on time interval is disabled by default
+            leader_change_time_interval: Duration::from_millis(0),
             raft,
             storage,
         }
@@ -61,9 +67,13 @@ impl<S: StorageExt> fmt::Debug for RaftEngineConfig<S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "RaftEngineConfig {{ peers: {:?}, period: {:?}, raft: {{ election_tick: {}, heartbeat_tick: {}, applied: {} }}, storage: {} }}",
+            "RaftEngineConfig {{ peers: {:?}, period: {:?}, 
+            leader_change_block_interval: {:?}, leader_change_time_interval: {:?},
+            raft: {{ election_tick: {}, heartbeat_tick: {}, applied: {} }}, storage: {} }}",
             self.peers,
             self.period,
+            self.leader_change_block_interval,
+            self.leader_change_time_interval,
             self.raft.election_tick,
             self.raft.heartbeat_tick,
             self.raft.applied,
@@ -88,6 +98,8 @@ pub fn load_raft_config(
         "sawtooth.consensus.raft.heartbeat_tick",
         "sawtooth.consensus.raft.election_tick",
         "sawtooth.consensus.raft.period",
+        "sawtooth.consensus.raft.leader_change_block_interval",
+        "sawtooth.consensus.raft.leader_change_time_interval",
     ];
 
     let settings: HashMap<String, String> = service
@@ -112,6 +124,23 @@ pub fn load_raft_config(
         let parsed: Result<u64, _> = period.parse();
         if let Ok(period) = parsed {
             config.period = Duration::from_millis(period);
+        }
+    }
+
+    if let Some(leader_change_block_interval)
+        = settings.get("sawtooth.consensus.raft.leader_change_block_interval") {
+        let parsed: Result<u64, _> = leader_change_block_interval.parse();
+        if let Ok(leader_change_block_interval) = parsed {
+            config.leader_change_block_interval = leader_change_block_interval;
+        }
+    }
+
+    if let Some(leader_change_time_interval)
+        = settings.get("sawtooth.consensus.raft.leader_change_time_interval") {
+        let parsed: Result<u64, _> = leader_change_time_interval.parse();
+        if let Ok(leader_change_time_interval) = parsed {
+            config.leader_change_time_interval
+                = Duration::from_millis(leader_change_time_interval);
         }
     }
 

@@ -76,6 +76,12 @@ pub struct SawtoothRaftNode<S: StorageExt> {
     block_queue: BlockQueue,
     raft_id_to_peer_id: HashMap<u64, PeerId>,
     period: Duration,
+    leader_change_block_interval: u64,
+    leader_blocks_committed: u64,
+    leader_change_time_interval: Duration,
+    leader_state_duration: Option<Instant>,
+    leader_transfer_initiated: Option<u64>,
+    next_raft_peer_id: Option<u64>,
 }
 
 impl<S: StorageExt> SawtoothRaftNode<S> {
@@ -84,7 +90,9 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
         raw_node: RawNode<S>,
         service: Box<Service>,
         peers: Vec<PeerId>,
-        period: Duration
+        period: Duration,
+        leader_change_block_interval: u64,
+        leader_change_time_interval: Duration
     ) -> Self {
         SawtoothRaftNode {
             peer_id,
@@ -95,6 +103,12 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
             block_queue: BlockQueue::new(),
             raft_id_to_peer_id: peers.into_iter().map(|peer_id| (peer_id_to_raft_id(&peer_id), peer_id)).collect(),
             period,
+            leader_change_block_interval,
+            leader_blocks_committed:0,
+            leader_change_time_interval,
+            leader_state_duration: None,
+            leader_transfer_initiated: None,
+            next_raft_peer_id: None,
         }
     }
 
@@ -133,10 +147,14 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
             },
             _ => false,
         } {
-            debug!("Leader({:?}) transition to Proposing block {:?}", self.peer_id, block_id);
-            info!("Leader({:?}) proposed block {:?}", self.peer_id, block_id);
-            self.raw_node.propose(vec![], block_id.clone().into()).expect("Failed to propose block to Raft");
-            self.leader_state = Some(LeaderState::Proposing(block_id));
+            // If leader transition is in progress then calling propose will fail.
+            // So remain in current state and wait for transition to happen
+            if self.leader_transfer_initiated.is_none() {
+                debug!("Leader({:?}) transition to Proposing block {:?}", self.peer_id, block_id);
+                info!("Leader({:?}) proposed block {:?}", self.peer_id, block_id);
+                self.raw_node.propose(vec![], block_id.clone().into()).expect("Failed to propose block to Raft");
+                self.leader_state = Some(LeaderState::Proposing(block_id));
+            }
         }
     }
 
@@ -149,6 +167,7 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
         } {
             let entry = self.block_queue.block_committed();
             self.raw_node.raft.mut_store().set_applied(entry).expect("Failed to set last applied entry.");
+            self.leader_blocks_committed += 1;
 
             if let Some(change) = self.check_for_conf_change(block_id.clone()) {
                 debug!("Leader({:?}) transition to ChangingConfig", self.peer_id);
@@ -185,6 +204,7 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
     pub fn tick(&mut self) {
         self.raw_node.tick();
         self.check_publish();
+        self.check_leader_change();
     }
 
     fn check_publish(&mut self) {
@@ -263,6 +283,9 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
                     self.service.initialize_block(None).expect("Failed to initialize block");
                 }
                 self.follower_state = None;
+                self.leader_state_duration = Some(Instant::now());
+                self.leader_blocks_committed = 0;
+                self.leader_transfer_initiated = None;
             }
             // If the peer is leader, the leader can send messages to other followers ASAP.
             for msg in ready.messages.drain(..) {
@@ -303,6 +326,9 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
                     _ => (),
                 }
                 self.leader_state = None;
+                self.leader_state_duration = None;
+                self.leader_blocks_committed = 0;
+                self.leader_transfer_initiated = None;
                 if self.follower_state.is_none() {
                     self.follower_state = Some(FollowerState::Idle);
                 }
@@ -435,7 +461,84 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
             _ => {}
         }
 
+        // Peer list might have changed. Calculate next raft peer id
+        self.next_raft_peer_id = self.find_next_peer();
+
         self.raw_node.apply_conf_change(&change);
         ReadyStatus::Continue
+    }
+
+    fn find_next_peer(&mut self) -> Option<u64> {
+        let node_raft_id = peer_id_to_raft_id(&self.peer_id);
+
+        // First sort the unordered raft id list
+        let mut raft_id_vec: Vec<_> = self.raft_id_to_peer_id.keys().collect();
+        raft_id_vec.sort();
+
+        // Find next peer in this list in round robin fashion
+        let position = raft_id_vec.iter().position(|&&raft_id| raft_id == node_raft_id);
+        let next_raft_peer_id = match position {
+            Some(x) => raft_id_vec.iter().cycle().nth(x+1),
+            _ => None,
+        };
+        //Converts Option<&&u64> to Option<u64>
+        next_raft_peer_id.map(|x| **x)
+    }
+
+    fn check_leader_change(&mut self) {
+        // Leader change can be initiated only if current node is leader
+        if self.leader_state.is_none() {
+            return;
+        }
+
+        // No need to change the leader if we have single node or no nodes in peer list
+        if self.raft_id_to_peer_id.len() <= 1 {
+            return;
+        }
+
+        // If leader transfer is already initiated then wait for leader to get elected
+        if self.leader_transfer_initiated.is_some(){
+            return;
+        }
+
+        // Check if leader_change_block_interval > 0 (feature enabled) and
+        // number of blocks committed by leader exceeds block interval
+        let is_leader_change_elapsed_block_interval = self.leader_change_block_interval > 0 &&
+            self.leader_blocks_committed >= self.leader_change_block_interval;
+
+        // Check if leader_change_time_interval > 0 (feature enabled) and
+        // leader time has elapsed
+        let is_leader_change_elapsed_time_interval = match self.leader_state_duration {
+             Some(instant) => {
+                self.leader_change_time_interval > Duration::from_millis(0) &&
+                instant.elapsed() >= self.leader_change_time_interval
+             }
+             _ => false
+        };
+
+        if is_leader_change_elapsed_time_interval || is_leader_change_elapsed_block_interval {
+            // Find next peer to transfer leadership
+            if self.next_raft_peer_id.is_none() {
+                self.next_raft_peer_id = self.find_next_peer();
+            }
+            match self.next_raft_peer_id {
+                Some(x) => {
+                    // Transfer leader to next peer
+                    self.raw_node.transfer_leader(x);
+                    self.leader_transfer_initiated = Some(x);
+                    info!("Leader transfer initiated from {:?} to {:?}", self.peer_id,
+                        self.raft_id_to_peer_id.get(&x));
+                    // Current leader to become follower in next term.
+                    // This will result in new leader election
+                    let term = self.raw_node.raft.term;
+                    self.raw_node.raft.become_follower(term+1,
+                        peer_id_to_raft_id(&self.peer_id));
+                    debug!("Leader will become Follower in Term: {:?}", term+1);
+                }
+                None => {
+                    warn!("No new leader found");
+                }
+            }
+        }
     }
 }

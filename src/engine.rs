@@ -67,6 +67,8 @@ impl Engine for RaftEngine {
         let RaftEngineConfig {
             peers,
             period,
+            leader_change_block_interval,
+            leader_change_time_interval,
             raft: raft_config,
             storage: raft_storage
         } = cfg;
@@ -87,7 +89,9 @@ impl Engine for RaftEngine {
             raw_node,
             service,
             peers,
-            period
+            period,
+            leader_change_block_interval,
+            leader_change_time_interval
         );
 
         let mut raft_ticker = ticker::Ticker::new(RAFT_TIMEOUT);
