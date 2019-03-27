@@ -178,6 +178,9 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
                 self.leader_state = Some(LeaderState::Building(Instant::now()));
                 self.service.initialize_block(None).expect("Failed to initialize block");
             }
+
+            // Update (period, time and block interval) if Raft settings changed
+            self.update_raft_settings(block_id.clone());
         }
 
         if match self.follower_state {
@@ -537,6 +540,57 @@ impl<S: StorageExt> SawtoothRaftNode<S> {
                 }
                 None => {
                     warn!("No new leader found");
+                }
+            }
+        }
+    }
+
+    fn update_raft_settings(&mut self, block_id: BlockId) {
+
+        let settings_keys = vec![
+            "sawtooth.consensus.raft.period",
+            "sawtooth.consensus.raft.leader_change_block_interval",
+            "sawtooth.consensus.raft.leader_change_time_interval",
+        ];
+
+        let settings: HashMap<String, String> = self.service
+            .get_settings(block_id, settings_keys.into_iter().map(String::from).collect())
+            .expect("Failed to get settings keys");
+
+        if let Some(period) = settings.get("sawtooth.consensus.raft.period") {
+            let parsed: Result<u64, _> = period.parse();
+            if let Ok(period) = parsed {
+                let new_period = Duration::from_millis(period);
+                if new_period != self.period {
+                    debug!("Raft period updated old: {:?} , new: {:?}",
+                        self.period, new_period);
+                    self.period = new_period;
+                }
+            }
+        }
+
+        if let Some(leader_change_block_interval)
+            = settings.get("sawtooth.consensus.raft.leader_change_block_interval") {
+            let parsed: Result<u64, _> = leader_change_block_interval.parse();
+            if let Ok(leader_change_block_interval) = parsed {
+                let new_leader_change_block_interval = leader_change_block_interval;
+                if new_leader_change_block_interval != self.leader_change_block_interval {
+                    debug!("Raft leader_change_block_interval updated old: {:?} , new: {:?}",
+                        self.leader_change_block_interval, new_leader_change_block_interval);
+                    self.leader_change_block_interval = new_leader_change_block_interval;
+                }
+            }
+        }
+
+        if let Some(leader_change_time_interval)
+            = settings.get("sawtooth.consensus.raft.leader_change_time_interval") {
+            let parsed: Result<u64, _> = leader_change_time_interval.parse();
+            if let Ok(leader_change_time_interval) = parsed {
+                let new_leader_change_time_interval = Duration::from_millis(leader_change_time_interval);
+                if new_leader_change_time_interval != self.leader_change_time_interval {
+                    debug!("Raft leader_change_time_interval updated old: {:?} , new: {:?}",
+                        self.leader_change_time_interval, new_leader_change_time_interval);
+                    self.leader_change_time_interval = new_leader_change_time_interval;
                 }
             }
         }
